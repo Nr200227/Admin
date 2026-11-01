@@ -135,9 +135,10 @@ html,body{margin:0;height:100%;overflow:hidden;background:#0b0f18;color:#f3ead6;
 </div></div>
 <div class="ov" id="mpOv"><div class="pn">
   <div class="ph"><b>👥 Jugar con amigos</b><span class="sp"></span><button class="x" data-close="mpOv">✕</button></div>
-  <div class="npc">Hasta 4 jugadores. Uno <b>crea la partida</b> y le pasa el código a los demás, que se <b>unen</b> con ese código. Cada uno conserva su personaje, su equipo y sus misiones.</div>
+  <div class="npc">Hasta 4 jugadores, desde cualquier red (WiFi o datos). Uno <b>crea la partida</b> y le pasa el código a los demás, que se <b>unen</b> con ese código. Cada uno conserva su personaje, su equipo y sus misiones.</div>
   <label style="font-size:14px">Tu nombre: <input id="mpName" maxlength="12" style="font-family:inherit;font-size:16px;padding:6px 8px;border-radius:8px;border:1px solid #8a7a5a;background:#120e18;color:#fff;width:150px"></label>
-  <div class="row"><button class="bt" id="mpHost">Crear partida</button><button class="bt" id="mpStart" style="display:none">▶ Empezar a jugar</button></div>
+  <div class="row"><button class="bt" id="mpHost">Crear partida</button></div>
+  <div class="row"><a class="bt alt" id="mpShare" target="_blank" rel="noopener" style="display:none;text-decoration:none">📲 Enviar por WhatsApp</a><button class="bt alt" id="mpCopy" style="display:none">📋 Copiar código</button><button class="bt" id="mpStart" style="display:none">▶ Empezar a jugar</button></div>
   <div class="row"><input id="mpCode" placeholder="CÓDIGO" maxlength="5" style="font-family:inherit;font-size:20px;letter-spacing:4px;text-transform:uppercase;padding:6px 8px;border-radius:8px;border:1px solid #8a7a5a;background:#120e18;color:#ffd77a;width:140px"><button class="bt alt" id="mpJoin">Unirse</button></div>
   <div class="msg" id="mpMsg"></div>
 </div></div>
@@ -1646,79 +1647,121 @@ function applySave(s){
   if(P.chest){CHEST.opened=true;CHEST.lid.rotation.x=-1.9}
 }
 
-/* ================= MULTIJUGADOR (PeerJS, sin servidor propio) ================= */
-const NET={on:false,host:false,guest:false,peer:null,conns:[],hostConn:null,name:'Jugador',remotes:{},sendT:0,esT:0,lastEq:'',known:{}};
-const ICE={config:{iceServers:[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'},{urls:'stun:global.stun.twilio.com:3478'},
-  {urls:'turn:openrelay.metered.ca:80',username:'openrelayproject',credential:'openrelayproject'},{urls:'turn:openrelay.metered.ca:443',username:'openrelayproject',credential:'openrelayproject'},{urls:'turn:openrelay.metered.ca:443?transport=tcp',username:'openrelayproject',credential:'openrelayproject'}]}};
+/* ================= MULTIJUGADOR (relé MQTT público: funciona en cualquier red) ================= */
+const NET={on:false,host:false,guest:false,clients:[],conns:[],me:'',base:'',code:'',name:'Jugador',remotes:{},sendT:0,esT:0,chkT:0,lastEq:'',hostLast:0,joinTimer:null};
+const BROKERS=['wss://broker.emqx.io:8084/mqtt','wss://broker.hivemq.com:8884/mqtt','wss://test.mosquitto.org:8081/mqtt'];
 const STATES=['idle','chase','circle','windup','strike','recover','stun'];
 let EID=0;
-function loadPeer(cb){if(window.Peer)return cb(true);const s=document.createElement('script');s.src='https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js';s.onload=()=>cb(!!window.Peer);s.onerror=()=>cb(false);document.head.appendChild(s)}
-function mpMsg(s,ok){const m=$('mpMsg');m.innerHTML=s;m.style.color=ok===false?'#f88':ok?'#8f8':'#e6dcc4'}
-function netSend(msg,except){
-  try{
-    if(NET.host)NET.conns.forEach(c=>{if(c.open&&c.peer!==except)c.send(msg)});
-    else if(NET.hostConn&&NET.hostConn.open)NET.hostConn.send(msg);
-  }catch(_){}
+function loadMqtt(cb){
+  if(window.mqtt)return cb(true);
+  const srcs=['https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js','https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js'];
+  let i=0;const next=()=>{if(i>=srcs.length)return cb(false);const s=document.createElement('script');s.src=srcs[i++];s.onload=()=>window.mqtt?cb(true):next();s.onerror=next;document.head.appendChild(s)};next();
 }
-function sendTo(id,msg){const c=NET.conns.find(c=>c.peer===id);try{if(c&&c.open)c.send(msg)}catch(_){}}
+function mpMsg(s,ok){const m=$('mpMsg');m.innerHTML=s;m.style.color=ok===false?'#f88':ok?'#8f8':'#e6dcc4'}
+function rid(n){const A='abcdefghijkmnpqrstuvwxyz23456789';let s='';for(let i=0;i<n;i++)s+=A[Math.floor(Math.random()*A.length)];return s}
+function randCode(){const A='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';let s='';for(let i=0;i<5;i++)s+=A[Math.floor(Math.random()*A.length)];return s}
+function pub(topic,obj){const s=JSON.stringify(obj);NET.clients.forEach(c=>{try{if(c.connected)c.publish(topic,s,{qos:0})}catch(_){}})}
+function netSend(msg,except){
+  if(NET.host)pub(NET.base+'/g',{f:'host',x:except||null,d:msg});
+  else if(NET.guest)pub(NET.base+'/h',{f:NET.me,d:msg});
+}
+function sendTo(id,msg){pub(NET.base+'/g/'+id,{f:'host',d:msg})}
+function mqConnect(url,onMsg,onUp){
+  const c=window.mqtt.connect(url,{clientId:'tdn_'+rid(10),clean:true,connectTimeout:7000,reconnectPeriod:2500,keepalive:25});
+  c.on('connect',()=>onUp(c));
+  c.on('message',(topic,payload)=>{let o;try{o=JSON.parse(payload.toString())}catch(_){return}onMsg(topic,o,c)});
+  c.on('error',()=>{});
+  return c;
+}
 function eqLite(){const o={};SLOTS.forEach(k=>{const it=P.eq[k];if(it)o[k]={slot:it.slot,model:it.model,r:it.r,kind:it.kind,id:it.id,up:it.up}});return o}
 function myState(){return{t:'p',x:+P.x.toFixed(2),z:+P.z.toFixed(2),y:+P.camY.toFixed(2),yaw:+P.yaw.toFixed(3),hp:Math.round(P.hp),mhp:S.mhp,lv:P.lv,an:CB.on?CB.kind+1:0,bl:blocking?1:0,dead:P.dead?1:0,name:NET.name}}
-function randCode(){const A='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';let s='';for(let i=0;i<5;i++)s+=A[Math.floor(Math.random()*A.length)];return s}
 function hostGame(){
   NET.name=($('mpName').value||'Jugador').slice(0,12);try{localStorage.setItem('tdn_name',NET.name)}catch(_){}
-  mpMsg('Conectando…');
-  loadPeer(ok=>{
-    if(!ok)return mpMsg('No se pudo cargar el módulo de red. Revisa tu conexión.',false);
-    const code=randCode();
-    const peer=new Peer('tdnorte-'+code,ICE);NET.peer=peer;
-    peer.on('open',()=>{
-      NET.on=true;NET.host=true;
-      mpMsg('Código de tu partida:<div style="font-size:34px;letter-spacing:6px;color:#ffd77a;margin:6px 0">'+code+'</div>Pásale este código a tu amigo. Puedes empezar a jugar ya: tus amigos entran cuando quieran.',true);
-      $('mpStart').style.display='inline-block';
-    });
-    peer.on('connection',conn=>{
-      conn.on('open',()=>{
-        if(NET.conns.length>=3){try{conn.send({t:'full'})}catch(_){}setTimeout(()=>conn.close(),400);return}
-        NET.conns.push(conn);
-        conn.on('data',d=>onGuestData(conn,d));
-        conn.on('close',()=>dropRemote(conn.peer,true));
-        conn.on('error',()=>dropRemote(conn.peer,true));
+  mpMsg('Conectando al servidor…');
+  loadMqtt(ok=>{
+    if(!ok){$('mpHost').disabled=false;return mpMsg('No se pudo cargar el módulo de red. Revisa tu internet y recarga.',false)}
+    NET.code=randCode();NET.base='tdnorte/v7/'+NET.code;NET.me='host';
+    let shown=false;
+    const fail=setTimeout(()=>{if(!shown){$('mpHost').disabled=false;mpMsg('No se pudo conectar a ningún servidor. Revisa tu internet e inténtalo otra vez.',false)}},16000);
+    BROKERS.forEach(url=>{
+      const c=mqConnect(url,onHostMsg,cl=>{
+        cl.subscribe(NET.base+'/h');
+        if(!shown){shown=true;clearTimeout(fail);NET.on=true;NET.host=true;showHostCode()}
       });
+      NET.clients.push(c);
     });
-    peer.on('error',err=>{
-      if(err&&err.type=='unavailable-id'){peer.destroy();hostGame();return}
-      if(!NET.on)mpMsg('Error de red: '+(err&&err.type||'desconocido'),false);
-    });
-    peer.on('disconnected',()=>{try{peer.reconnect()}catch(_){}});
   });
+}
+function showHostCode(){
+  const c=NET.code;
+  mpMsg('Código de tu partida:<div style="font-size:36px;letter-spacing:7px;color:#ffd77a;margin:6px 0;user-select:text">'+c+'</div>Pásale este código a tu amigo y quédate con el juego abierto en pantalla mientras entra.',true);
+  $('mpShare').style.display='inline-block';$('mpCopy').style.display='inline-block';$('mpStart').style.display='inline-block';
+  $('mpShare').href='https://wa.me/?text='+encodeURIComponent('¡Juega conmigo a Tierras del Norte! Abre '+location.href.split('#')[0]+' → 👥 Jugar con amigos → código: '+c);
+}
+function onHostMsg(topic,o){
+  if(!o||!o.f||!o.d||o.f==='host')return;
+  const id=o.f;let conn=NET.conns.find(c=>c.peer===id);
+  if(!conn){
+    if(o.d.t!=='hello')return;
+    if(NET.conns.length>=3){sendTo(id,{t:'full'});return}
+    conn={peer:id,open:true,last:nowS(),send:m=>sendTo(id,m)};NET.conns.push(conn);
+  }
+  conn.last=nowS();
+  onGuestData(conn,o.d);
 }
 function joinGame(){
   NET.name=($('mpName').value||'Jugador').slice(0,12);try{localStorage.setItem('tdn_name',NET.name)}catch(_){}
   const code=($('mpCode').value||'').toUpperCase().replace(/[^A-Z0-9]/g,'');
   if(code.length!==5)return mpMsg('Escribe el código de 5 letras que te dio tu amigo.',false);
-  mpMsg('Buscando la partida '+code+'…');
-  loadPeer(ok=>{
-    if(!ok)return mpMsg('No se pudo cargar el módulo de red. Revisa tu conexión.',false);
-    const peer=new Peer(ICE);NET.peer=peer;
-    const to=setTimeout(()=>{if(!NET.on)mpMsg('No se pudo conectar. Revisa el código y que tu amigo tenga la partida abierta. Si siguen fallando, prueben en la misma red WiFi.',false)},15000);
-    peer.on('open',()=>{
-      const conn=peer.connect('tdnorte-'+code,{reliable:true,serialization:'json'});NET.hostConn=conn;
-      conn.on('open',()=>{conn.send({t:'hello',name:NET.name})});
-      conn.on('data',d=>{
-        if(d.t=='full'){clearTimeout(to);mpMsg('La partida está llena (máximo 4 jugadores).',false);return}
-        if(d.t=='welcome'&&!NET.on){clearTimeout(to);NET.on=true;NET.guest=true;mpMsg('¡Conectado!',true);closeOv('mpOv');begin(!!loadSave());feed('👥 Te uniste a la partida de <b>'+d.name+'</b>')}
-        onHostData(d);
+  $('mpJoin').disabled=true;
+  mpMsg('Conectando al servidor…');
+  loadMqtt(ok=>{
+    if(!ok){$('mpJoin').disabled=false;return mpMsg('No se pudo cargar el módulo de red. Revisa tu internet y recarga.',false)}
+    NET.code=code;NET.base='tdnorte/v7/'+code;NET.me=rid(8);
+    let bi=0;
+    const tryBroker=()=>{
+      if(bi>=BROKERS.length){$('mpJoin').disabled=false;return mpMsg('No se pudo conectar a ningún servidor. Revisa tu internet.',false)}
+      const url=BROKERS[bi++];let up=false;
+      const c=mqConnect(url,onGuestMsg,cl=>{
+        cl.subscribe([NET.base+'/g',NET.base+'/g/'+NET.me]);
+        if(!up){up=true;startHello()}
       });
-      conn.on('close',()=>{if(NET.guest)lostHost()});
-    });
-    peer.on('error',err=>{if(err&&err.type=='peer-unavailable'){clearTimeout(to);mpMsg('No existe una partida con ese código.',false)}else if(!NET.on)mpMsg('Error de red: '+(err&&err.type||'desconocido'),false)});
+      NET.clients=[c];
+      setTimeout(()=>{if(!up){try{c.end(true)}catch(_){}tryBroker()}},8000);
+    };
+    tryBroker();
   });
+}
+function startHello(){
+  mpMsg('Buscando la partida '+NET.code+'…');
+  let n=0;clearInterval(NET.joinTimer);
+  const hello=()=>{pub(NET.base+'/h',{f:NET.me,d:{t:'hello',name:NET.name}})};
+  hello();
+  NET.joinTimer=setInterval(()=>{
+    if(NET.on){clearInterval(NET.joinTimer);return}
+    n++;hello();
+    if(n==4)mpMsg('Buscando la partida '+NET.code+'…<br><small>Tu amigo debe tener el juego abierto en pantalla (no en WhatsApp).</small>');
+    if(n>=12){clearInterval(NET.joinTimer);$('mpJoin').disabled=false;mpMsg('No se encontró la partida <b>'+NET.code+'</b>. Revisa el código y que tu amigo tenga el juego abierto y haya tocado "Crear partida".',false)}
+  },2500);
+}
+function onGuestMsg(topic,o){
+  if(!o||o.f!=='host'||!o.d)return;
+  if(o.x&&o.x===NET.me)return;
+  NET.hostLast=nowS();
+  const d=o.d;
+  if(!NET.on){
+    if(d.t=='full'){clearInterval(NET.joinTimer);$('mpJoin').disabled=false;mpMsg('La partida está llena (máximo 4 jugadores).',false);return}
+    if(d.t=='welcome'){clearInterval(NET.joinTimer);NET.on=true;NET.guest=true;mpMsg('¡Conectado!',true);closeOv('mpOv');begin(!!loadSave());feed('👥 Te uniste a la partida de <b>'+escapeHtml(d.name)+'</b>')}
+    else return;
+  }
+  onHostData(d);
 }
 function lostHost(){
   if(!NET.guest)return;
   NET.guest=false;NET.on=false;
   Object.keys(NET.remotes).forEach(id=>dropRemote(id));
   enemies.forEach(e=>scene.remove(e.g));enemies.length=0;populate();
+  NET.clients.forEach(c=>{try{c.end(true)}catch(_){}});NET.clients=[];
   toast('Se perdió la conexión con el anfitrión.<br><span style="font-size:15px">Sigues jugando solo.</span>');
   $('bChat').style.display='none';
 }
@@ -1726,14 +1769,14 @@ function onGuestData(conn,d){
   const id=conn.peer;
   switch(d.t){
     case 'hello':{
-      const r=getRemote(id);r.name=d.name;
+      const isNew=!NET.remotes[id];const r=getRemote(id);r.name=d.name;
       conn.send({t:'welcome',name:NET.name});
       conn.send(Object.assign(myState(),{from:'host'}));conn.send({t:'eq',from:'host',eq:eqLite()});
-      // presentar a los demás jugadores ya conectados
       Object.values(NET.remotes).forEach(o=>{if(o.id!==id){if(o.lastP)conn.send(Object.assign({},o.lastP,{from:o.id}));if(o.lastEq)conn.send({t:'eq',from:o.id,eq:o.lastEq})}});
-      sendSnapshot(true);
-      feed('👥 <b>'+d.name+'</b> se unió a la partida');netSend({t:'chat',from:'sys',name:'',msg:d.name+' se unió a la partida'},id);sfx(660,.3,'triangle',.06);
+      sendSnapshot();
+      if(isNew){feed('👥 <b>'+escapeHtml(d.name)+'</b> se unió a la partida');netSend({t:'chat',from:'sys',name:'',msg:d.name+' se unió a la partida'},id);sfx(660,.3,'triangle',.06)}
       break}
+    case 'bye':dropRemote(id,true);break;
     case 'p':case 'eq':case 'chat':case 'fx':d.from=id;applyRemote(d);netSend(d,id);break;
     case 'hit':{const e=enemies.find(x=>x.id===d.id);if(e&&!e.dead)damageEnemy(e,d.dmg,d.crit,Object.assign(d.o||{},{remote:true}));break}
     case 'need':{const t=d.type;if(t=='dragon'){if(!enemies.some(e=>e.type=='dragon'&&!e.dead)){const dd=spawnEnemy('dragon',0,CZ-4);dd.g.rotation.y=Math.PI}}
@@ -1748,8 +1791,11 @@ function onHostData(d){
     case 'hurt':{const e=enemies.find(x=>x.id===d.id);hurt(d.raw,e||{x:d.sx,z:d.sz});break}
     case 'efire':spawnFireball(d.x,d.y,d.z,d.vx,d.vy,d.vz,d.dmg,false);break;
     case 'leave':dropRemote(d.id);break;
+    case 'bye':lostHost();break;
   }
 }
+addEventListener('pagehide',()=>{if(NET.on)netSend({t:'bye'})});
+
 function dropRemote(id,announce){
   const r=NET.remotes[id];
   if(r){scene.remove(r.g);if(announce)feed('👥 <b>'+r.name+'</b> salió de la partida');delete NET.remotes[id]}
@@ -1858,11 +1904,14 @@ function giveRewards(d){
 function netTick(dt){
   updRemotes(dt);
   NET.sendT-=dt;
-  if(NET.sendT<=0){NET.sendT=1/15;
+  NET.chkT-=dt;if(NET.chkT<=0){NET.chkT=1;const n=nowS();
+    if(NET.host)NET.conns.slice().forEach(c=>{if(n-c.last>25)dropRemote(c.peer,true)});
+    if(NET.guest&&n-NET.hostLast>35)lostHost();}
+  if(NET.sendT<=0){NET.sendT=.1;
     const st=myState();if(NET.host)st.from='host';netSend(st);
     const ek=JSON.stringify(eqLite());if(ek!==NET.lastEq){NET.lastEq=ek;netSend({t:'eq',from:NET.host?'host':undefined,eq:eqLite()})}
   }
-  if(NET.host){NET.esT-=dt;if(NET.esT<=0){NET.esT=.1;sendSnapshot()}}
+  if(NET.host){NET.esT-=dt;if(NET.esT<=0){NET.esT=.2;sendSnapshot()}}
 }
 function sendChat(){
   const i=$('chatIn'),m=(i.value||'').trim().slice(0,120);if(!m)return;i.value='';
@@ -1938,6 +1987,7 @@ try{$('mpName').value=localStorage.getItem('tdn_name')||''}catch(_){}
 $('mpBtn').addEventListener('click',()=>{$('mpOv').style.display='flex'});
 $('mpHost').addEventListener('click',()=>{$('mpHost').disabled=true;hostGame()});
 $('mpJoin').addEventListener('click',()=>joinGame());
+$('mpCopy').addEventListener('click',()=>{try{navigator.clipboard.writeText(NET.code).then(()=>{$('mpCopy').textContent='✔ Copiado'},()=>{})}catch(_){}});
 $('mpStart').addEventListener('click',()=>{closeOv('mpOv');begin(!!loadSave())});
 $('chatSend').addEventListener('click',sendChat);
 bindBtn('bChat',()=>{if(started){openOv('chatOv');setTimeout(()=>$('chatIn').focus(),50)}});
